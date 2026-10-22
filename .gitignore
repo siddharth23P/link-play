@@ -1,0 +1,26 @@
+# Build output
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+build.log
+.DS_Store
+.idea/
+*.iml
+
+# Release signing: never commit
+android/keystore.properties
+*.jks
+*.keystore
+
+# Games, saves and APKs: bring your own, ship APKs on the Releases page
+ROM/
+saves/
+dist/
+bin/
+*.gba
+*.sav
+*.ss
+*.apk
