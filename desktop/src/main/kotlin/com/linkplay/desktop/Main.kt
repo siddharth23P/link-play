@@ -13,7 +13,7 @@ import kotlin.system.exitProcess
  */
 object AppInfo {
     const val NAME = "Link Play"
-    const val DEV_VERSION = "1.1.0"
+    const val DEV_VERSION = "1.1.1"
     val VERSION: String = System.getProperty("jpackage.app-version")?.takeIf { it.isNotBlank() } ?: DEV_VERSION
 }
 

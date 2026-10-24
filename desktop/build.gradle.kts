@@ -10,7 +10,7 @@ plugins {
 // Link Play for macOS and Windows: a Swing app around the same mGBA core and NetLink code as the
 // phone app. It compiles the phone's link-play package (android/.../net) unchanged, so computers and
 // phones share codes and protocol and can link with each other.
-version = "1.1.0"
+version = "1.1.1"
 
 kotlin {
     compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
