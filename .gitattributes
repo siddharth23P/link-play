@@ -1,0 +1,24 @@
+# Line endings. Windows checkouts (core.autocrlf=true is the Git for Windows default) must not turn
+# shell scripts and the Gradle wrapper into CRLF: "bad interpreter: /bin/sh^M" and "set: -: invalid option".
+* text=auto
+
+# Run by sh/bash on every platform, so always LF.
+*.sh text eol=lf
+/android/gradlew text eol=lf
+
+# Run by cmd.exe, so always CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files: never convert, never diff as text.
+*.png binary
+*.ico binary
+*.icns binary
+*.jar binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.ttf binary
+*.otf binary
+*.gba binary
+*.ss binary

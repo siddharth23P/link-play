@@ -1,17 +1,28 @@
 /*
- * Link Play native core for Android: one GBA (mGBA) on its own thread, audio
- * through AAudio, video through a small GLES3 renderer, the NetLink driver
- * (../../../../../native/netlink.c) for link play over the network, and
- * TouchNav (native/touchnav.c) turning taps / drags on the picture into menu moves.
- * Everything Java-facing is in com.linkplay.app.Native.
+ * Link Play native core, shared by the Android app and the desktop app (macOS, Windows): one GBA
+ * (mGBA) on its own thread, the NetLink driver (netlink.c) for link play over the network, and
+ * TouchNav (touchnav.c) turning taps / drags on the picture into menu moves.
+ *   Android (__ANDROID__): audio through AAudio, video through a small GLES3 renderer
+ *     (android/app/src/main/cpp/render.c, which calls the bridgeFrame* functions at the bottom).
+ *   Desktop: no audio device and no GL in here. The Java side pulls PCM with audioRead and the
+ *     picture with copyFrameRgb. Windows and macOS differ only in the small helpers under
+ *     "portability helpers" (clock, sleep, file replace); desktop never reads the user's own
+ *     mGBA config.
+ * Built by android/app/src/main/cpp/CMakeLists.txt (libgbalink.so) and desktop/native/CMakeLists.txt
+ * (libgbalink.dylib / gbalink.dll). Everything Java-facing is in com.linkplay.app.Native.
  */
 #include <jni.h>
+#ifdef __ANDROID__
 #include <android/log.h>
 #include <aaudio/AAudio.h>
 #include <dlfcn.h>
-#include <unistd.h>
 #include <android/api-level.h>
 #include "render.h"
+#endif
+
+// First of the mGBA headers on purpose: on Windows it includes winsock2.h before anything can pull in
+// windows.h (the other order breaks with redefinition errors).
+#include <mgba-util/common.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,7 +33,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include <mgba/core/core.h>
 #include <mgba/core/config.h>
@@ -36,10 +49,28 @@
 
 #include "netlink.h"
 #include "touchnav.h"
+#ifdef _WIN32
+#include <windows.h> // already in via winsock2.h (mgba-util/common.h); explicit for what is called here
+#include <mmsystem.h> // timeBeginPeriod / timeEndPeriod (winmm)
+#endif
 
 #define TAG "LinkPlay"
+#ifdef __ANDROID__
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+// Desktop: stderr (where that ends up is up to the launcher).
+static void _logf(const char* level, const char* format, ...) {
+	va_list args;
+	va_start(args, format);
+	fprintf(stderr, "%s/%s: ", level, TAG);
+	vfprintf(stderr, format, args);
+	fputc('\n', stderr);
+	va_end(args);
+}
+#define LOGI(...) _logf("I", __VA_ARGS__)
+#define LOGE(...) _logf("E", __VA_ARGS__)
+#endif
 
 #define FRAME_NS 16742706LL /* 280896 cycles at 16.78 MHz: 59.73 fps */
 #define AUDIO_RATE 48000
@@ -47,6 +78,9 @@
 #define AUDIO_MAX_LATENCY (AUDIO_RATE * 12 / 100) /* keep at most 120 ms queued */
 #define CABLE_NONE (-1)
 #define CABLE_DETACH (-2)
+#if defined(__ANDROID__) || defined(__linux__)
+#define OUT_COND_MONOTONIC /* pthread_condattr_setclock exists (not on macOS; winpthreads ignores it) */
+#endif
 
 static struct {
 	struct mCore* core;
@@ -72,7 +106,9 @@ static struct {
 	struct mAudioBuffer audioOut;
 	struct mAudioResampler resampler;
 	unsigned sourceRate;
+#ifdef __ANDROID__
 	AAudioStream* stream;
+#endif
 	pthread_mutex_t audioMutex;
 	int16_t ring[AUDIO_RING_FRAMES * 2];
 	unsigned ringHead, ringCount;
@@ -97,7 +133,7 @@ static struct {
 
 // ---------------------------------------------------------------- logging
 
-static void _log(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
+static void _logCallback(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
 	(void) logger;
 	if (!(level & (mLOG_FATAL | mLOG_ERROR))) {
 		return;
@@ -106,7 +142,7 @@ static void _log(struct mLogger* logger, int category, enum mLogLevel level, con
 	vsnprintf(buf, sizeof(buf), format, args);
 	LOGE("[%s] %s", mLogCategoryName(category), buf);
 }
-static struct mLogger logger = { .log = _log };
+static struct mLogger logger = { .log = _logCallback };
 
 // ---------------------------------------------------------------- NetLink plumbing
 
@@ -172,10 +208,9 @@ static void _applyNetCommands(void) {
 
 // ---------------------------------------------------------------- audio
 
-static aaudio_data_callback_result_t _audioCallback(AAudioStream* stream, void* user, void* data, int32_t frames) {
-	(void) stream;
-	(void) user;
-	int16_t* out = data;
+// Fills [frames] stereo frames from the ring (volume applied), the rest with silence; returns how
+// many were real audio. The Android audio callback and the desktop Native.audioRead both call this.
+static int32_t _audioPull(int16_t* out, int32_t frames) {
 	float vol = atomic_load(&G.volume);
 	pthread_mutex_lock(&G.audioMutex);
 	int32_t i = 0;
@@ -186,6 +221,14 @@ static aaudio_data_callback_result_t _audioCallback(AAudioStream* stream, void* 
 	}
 	pthread_mutex_unlock(&G.audioMutex);
 	memset(&out[i * 2], 0, (frames - i) * 4); // underrun: silence
+	return i;
+}
+
+#ifdef __ANDROID__
+static aaudio_data_callback_result_t _audioCallback(AAudioStream* stream, void* user, void* data, int32_t frames) {
+	(void) stream;
+	(void) user;
+	_audioPull(data, frames);
 	return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -208,6 +251,7 @@ static void _openAudio(void) {
 	}
 	AAudioStreamBuilder_delete(builder);
 }
+#endif
 
 static void _pushAudio(void) {
 	unsigned rate = G.core->audioSampleRate(G.core);
@@ -245,11 +289,159 @@ static void _flushSave(void) {
 	}
 }
 
+// ---------------------------------------------------------------- portability helpers
+
+#ifdef _WIN32
+static long long _nowNs(void) {
+	static LARGE_INTEGER freq;
+	LARGE_INTEGER c;
+	if (!freq.QuadPart) {
+		QueryPerformanceFrequency(&freq);
+	}
+	QueryPerformanceCounter(&c);
+	return (c.QuadPart / freq.QuadPart) * 1000000000LL + (c.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart;
+}
+
+// The default timer tick is 15.6 ms, almost as long as a whole frame, so a plain sleep wakes late and
+// frames arrive in uneven pairs. Ask for 1 ms ticks while the emulation thread runs, and wait on a
+// high-resolution timer where there is one (Windows 10 1803+; recent Windows may ignore the 1 ms request
+// for a hidden window, the timer is the main path). Without it: sleep most of the wait, spin the rest.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x2 // older headers
+#endif
+static HANDLE _tickTimer; // owned by the emulation thread
+
+static void _timerBegin(void) {
+	timeBeginPeriod(1);
+	_tickTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+}
+
+static void _timerEnd(void) {
+	if (_tickTimer) {
+		CloseHandle(_tickTimer);
+		_tickTimer = NULL;
+	}
+	timeEndPeriod(1);
+}
+
+// Emulation thread only (the timer handle is not shared).
+static void _sleepNs(long long ns) {
+	if (ns <= 0) {
+		return;
+	}
+	if (_tickTimer) {
+		LARGE_INTEGER due;
+		due.QuadPart = -(ns / 100); // negative: relative, in 100 ns units
+		if (SetWaitableTimer(_tickTimer, &due, 0, NULL, NULL, FALSE)) {
+			WaitForSingleObject(_tickTimer, INFINITE);
+			return;
+		}
+	}
+	long long until = _nowNs() + ns;
+	for (long long left = ns; left > 0; left = until - _nowNs()) {
+		if (left > 2000000LL) {
+			Sleep((DWORD) ((left - 1000000LL) / 1000000LL));
+		} else {
+			YieldProcessor();
+		}
+	}
+}
+
+// Any other thread: a plain sleep is precise enough.
+static void _idleSleepMs(int ms) {
+	Sleep(ms > 0 ? (DWORD) ms : 0);
+}
+
+// Absolute CLOCK_REALTIME-style deadline [ms] from now, for pthread_cond_timedwait on winpthreads
+// (which has no pthread_condattr_setclock and reads the deadline as wall-clock time).
+static void _deadlineIn(struct timespec* t, long long ms) {
+	FILETIME ft;
+	GetSystemTimeAsFileTime(&ft);
+	unsigned long long u = ((unsigned long long) ft.dwHighDateTime << 32 | ft.dwLowDateTime) - 116444736000000000ULL;
+	long long ns = (long long) (u % 10000000ULL) * 100 + ms * 1000000LL;
+	t->tv_sec = (time_t) (u / 10000000ULL + ns / 1000000000LL);
+	t->tv_nsec = (long) (ns % 1000000000LL);
+}
+
+static wchar_t* _wide(const char* utf8) {
+	int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+	wchar_t* w = n > 0 ? malloc(n * sizeof(*w)) : NULL;
+	if (w && !MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, n)) {
+		free(w);
+		w = NULL;
+	}
+	return w;
+}
+
+// rename() onto an existing file fails on Windows, and it only knows the ANSI code page.
+static bool _replaceFile(const char* from, const char* to) {
+	wchar_t* wf = _wide(from);
+	wchar_t* wt = _wide(to);
+	bool ok = wf && wt && MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+	free(wf);
+	free(wt);
+	return ok;
+}
+
+static void _removeFile(const char* path) {
+	wchar_t* w = _wide(path);
+	if (w) {
+		DeleteFileW(w);
+		free(w);
+	}
+}
+#else
 static long long _nowNs(void) {
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec * 1000000000LL + t.tv_nsec;
 }
+
+#ifdef __APPLE__
+// The emulation thread produces a frame every 16.7 ms: tell the scheduler it is user-facing work, so it
+// stays off the efficiency cores and its timers are not coalesced.
+static void _timerBegin(void) {
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+}
+#else
+static void _timerBegin(void) {}
+#endif
+static void _timerEnd(void) {}
+
+static void _sleepNs(long long ns) {
+	if (ns <= 0) {
+		return;
+	}
+	struct timespec d = { ns / 1000000000LL, ns % 1000000000LL };
+	while (nanosleep(&d, &d) && errno == EINTR);
+}
+
+static void _idleSleepMs(int ms) {
+	_sleepNs((ms > 0 ? ms : 0) * 1000000LL);
+}
+
+// Absolute deadline [ms] from now. Android and Linux wait on a CLOCK_MONOTONIC condition
+// variable (outCond, see load()); macOS has no pthread_condattr_setclock, so it waits on the
+// default (realtime) clock.
+static void _deadlineIn(struct timespec* t, long long ms) {
+#ifdef OUT_COND_MONOTONIC
+	clock_gettime(CLOCK_MONOTONIC, t);
+#else
+	clock_gettime(CLOCK_REALTIME, t);
+#endif
+	long long ns = t->tv_nsec + ms * 1000000LL;
+	t->tv_sec += ns / 1000000000LL;
+	t->tv_nsec = ns % 1000000000LL;
+}
+
+static bool _replaceFile(const char* from, const char* to) {
+	return rename(from, to) == 0;
+}
+
+static void _removeFile(const char* path) {
+	unlink(path);
+}
+#endif
 
 // ---------------------------------------------------------------- savestates (autosave)
 
@@ -271,8 +463,8 @@ static bool _saveStateTo(const char* path) {
 	bool ok = mCoreSaveStateNamed(G.core, vf, SAVESTATE_RTC | SAVESTATE_METADATA);
 	ok = ok && vf->sync(vf, NULL, 0);
 	vf->close(vf);
-	if (!ok || rename(tmp, path) != 0) {
-		unlink(tmp);
+	if (!ok || !_replaceFile(tmp, path)) {
+		_removeFile(tmp);
 		return false;
 	}
 	return true;
@@ -309,6 +501,7 @@ static void _serviceState(void) {
 
 // ---------------------------------------------------------------- ADPF hint session (API 33+, resolved at runtime)
 
+#ifdef __ANDROID__
 typedef void* (*PfnGetMgr)(void);
 typedef void* (*PfnCreate)(void*, const int32_t*, size_t, int64_t);
 typedef int (*PfnReport)(void*, int64_t);
@@ -342,10 +535,22 @@ static void _hintClose(void) {
 	}
 }
 
+static void _hintReport(long long workNs) {
+	if (Hint.sess) {
+		Hint.report(Hint.sess, workNs);
+	}
+}
+#else
+static void _hintOpen(void) {}
+static void _hintClose(void) {}
+static void _hintReport(long long workNs) { (void) workNs; }
+#endif
+
 static void* _emuLoop(void* unused) {
 	(void) unused;
 	long long next = _nowNs();
 	_hintOpen();
+	_timerBegin();
 	bool catchUp = false;
 	int skipped = 0;
 	long long catchSince = 0, noCatchUntil = 0;
@@ -358,7 +563,7 @@ static void* _emuLoop(void* unused) {
 		_applyNetCommands();
 		_serviceState(); // also while paused: the app snapshots when it goes to the background
 		if (atomic_load(&G.paused)) {
-			usleep(10000);
+			_sleepNs(10000000LL);
 			next = _nowNs();
 			continue;
 		}
@@ -398,8 +603,7 @@ static void* _emuLoop(void* unused) {
 			next += FRAME_NS / 4;
 			long long now = _nowNs();
 			if (next > now) {
-				struct timespec d = { (next - now) / 1000000000LL, (next - now) % 1000000000LL };
-				while (nanosleep(&d, &d) && errno == EINTR);
+				_sleepNs(next - now);
 			} else if (next < now - FRAME_NS) {
 				next = now;
 			}
@@ -417,25 +621,47 @@ static void* _emuLoop(void* unused) {
 		} else {
 			_pushAudio();
 		}
-		if (Hint.sess) {
-			Hint.report(Hint.sess, _nowNs() - workStart);
-		}
+		_hintReport(_nowNs() - workStart);
 
 		next += catchingUp ? FRAME_NS / 4 : FRAME_NS / speed;
 		long long now = _nowNs();
 		if (next < now - FRAME_NS * 4) {
 			next = now; // fell behind (e.g. app was stalled): don't burst
 		} else if (next > now) {
-			struct timespec d = { (next - now) / 1000000000LL, (next - now) % 1000000000LL };
-			while (nanosleep(&d, &d) && errno == EINTR);
+			_sleepNs(next - now);
 		}
 	}
 	_hintClose();
+	_timerEnd();
 	_flushSave();
 	return NULL;
 }
 
 // ---------------------------------------------------------------- JNI: lifecycle
+
+// Takes the core and everything hanging off it down; used by stop() and by a load() that fails half way.
+// The caller holds stateMutex (no snapshot op may touch the core while it goes) and the emulation thread
+// is not running. Requires G.core.
+static void _closeCore(void) {
+	if (G.netAttached) {
+		G.core->setPeripheral(G.core, mPERIPH_GBA_LINK_PORT, NULL);
+		NetLinkDestroy(&G.net);
+		G.netAttached = false;
+	}
+	if (atomic_exchange(&G.touchReady, false)) {
+		TouchNavDeinit(&G.touch);
+	}
+	mCoreConfigDeinit(&G.core->config); // lives inside the core, so before the core is freed
+	G.core->deinit(G.core);
+	G.core = NULL;
+	// A display thread may be copying the picture this very moment: take the buffer away under its lock.
+	pthread_mutex_lock(&G.frameMutex);
+	free(G.frame);
+	G.frame = NULL;
+	pthread_mutex_unlock(&G.frameMutex);
+	free(G.video);
+	G.video = NULL;
+}
 
 JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_load(JNIEnv* env, jclass cls, jstring jrom, jstring jsave) {
 	(void) cls;
@@ -445,6 +671,9 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_load(JNIEnv* env, jclass
 	const char* rom = (*env)->GetStringUTFChars(env, jrom, NULL);
 	const char* save = (*env)->GetStringUTFChars(env, jsave, NULL);
 	bool ok = false;
+	if (!rom || !save) {
+		goto done;
+	}
 	mLogSetDefaultLogger(&logger);
 	if (!G.syncInit) { // a later load must not re-initialise primitives a polling thread may be waiting on
 		pthread_mutex_init(&G.frameMutex, NULL);
@@ -452,11 +681,15 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_load(JNIEnv* env, jclass
 		pthread_cond_init(&G.stateCond, NULL);
 		pthread_mutex_init(&G.audioMutex, NULL);
 		pthread_mutex_init(&G.outMutex, NULL);
+#ifdef OUT_COND_MONOTONIC
 		pthread_condattr_t ca;
 		pthread_condattr_init(&ca);
 		pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
 		pthread_cond_init(&G.outCond, &ca);
 		pthread_condattr_destroy(&ca);
+#else
+		pthread_cond_init(&G.outCond, NULL); // _deadlineIn uses the realtime clock here
+#endif
 		G.syncInit = true;
 	}
 	atomic_store(&G.pendingCable, CABLE_NONE);
@@ -465,6 +698,7 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_load(JNIEnv* env, jclass
 	G.core = mCoreFind(rom);
 	if (!G.core || !G.core->init(G.core)) {
 		LOGE("no core for %s", rom);
+		free(G.core); // mCoreFind's allocation; init failed before the core owned anything else
 		G.core = NULL;
 		goto done;
 	}
@@ -472,20 +706,34 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_load(JNIEnv* env, jclass
 	mCoreConfigSetValue(&G.core->config, "idleOptimization", "remove");
 	mCoreConfigSetDefaultIntValue(&G.core->config, "volume", 0x100);
 	mCoreConfigSetDefaultIntValue(&G.core->config, "mute", 0);
+#ifdef __ANDROID__
 	mCoreLoadConfig(G.core);
+#else
+	// Not mCoreLoadConfig (reads the user's own mGBA config) and not mCoreLoadForeignConfig (its
+	// mDirectorySetMapOptions creates mGBA's config folder). Do the same steps minus the directory set.
+	mCoreConfigMap(&G.core->config, &G.core->opts);
+	if (G.core->opts.audioBuffers) {
+		G.core->setAudioBufferSize(G.core, G.core->opts.audioBuffers);
+	}
+	G.core->loadConfig(G.core, &G.core->config);
+#endif
 	G.core->baseVideoSize(G.core, &G.width, &G.height);
 	G.video = calloc(G.width * G.height, sizeof(mColor));
 	G.frame = calloc(G.width * G.height, 4);
+	if (!G.video || !G.frame) {
+		LOGE("out of memory");
+		goto fail;
+	}
 	G.core->setVideoBuffer(G.core, G.video, G.width);
 	G.core->setAudioBufferSize(G.core, 2048);
 	if (!mCoreLoadFile(G.core, rom)) {
 		LOGE("could not load %s", rom);
-		goto done;
+		goto fail;
 	}
 	struct VFile* vf = VFileOpen(save, O_CREAT | O_RDWR);
 	if (!vf || !G.core->loadSave(G.core, vf)) {
 		LOGE("could not open save %s", save);
-		goto done;
+		goto fail;
 	}
 	G.core->reset(G.core);
 	TouchNavInit(&G.touch, G.core);
@@ -493,11 +741,29 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_load(JNIEnv* env, jclass
 	mAudioBufferInit(&G.audioOut, 8192, 2);
 	mAudioResamplerInit(&G.resampler, mINTERPOLATOR_COSINE);
 	mAudioResamplerSetDestination(&G.resampler, &G.audioOut, AUDIO_RATE);
+	// The resampler above is new and has no source yet; _pushAudio only sets one when the rate changes,
+	// and a second game reports the same 32768 Hz, so forget the old rate (else: crash in the resampler).
+	G.sourceRate = 0;
+	// Nothing of the previous game's sound or held buttons may carry over.
+	pthread_mutex_lock(&G.audioMutex);
+	G.ringHead = G.ringCount = 0;
+	pthread_mutex_unlock(&G.audioMutex);
+	atomic_store(&G.keys, 0);
+	atomic_store(&G.latched, 0);
 	ok = true;
 	LOGI("loaded %s (%ux%u)", rom, G.width, G.height);
+	goto done;
+fail: // leave nothing half set up: a retry must start from scratch, not find a core without a game
+	pthread_mutex_lock(&G.stateMutex);
+	_closeCore();
+	pthread_mutex_unlock(&G.stateMutex);
 done:
-	(*env)->ReleaseStringUTFChars(env, jrom, rom);
-	(*env)->ReleaseStringUTFChars(env, jsave, save);
+	if (rom) {
+		(*env)->ReleaseStringUTFChars(env, jrom, rom);
+	}
+	if (save) {
+		(*env)->ReleaseStringUTFChars(env, jsave, save);
+	}
 	return ok;
 }
 
@@ -509,7 +775,9 @@ JNIEXPORT void JNICALL Java_com_linkplay_app_Native_start(JNIEnv* env, jclass cl
 	}
 	atomic_store(&G.quit, false);
 	atomic_store(&G.paused, false);
+#ifdef __ANDROID__
 	_openAudio();
+#endif
 	pthread_create(&G.thread, NULL, _emuLoop, NULL);
 	G.threadStarted = true;
 }
@@ -521,6 +789,7 @@ JNIEXPORT void JNICALL Java_com_linkplay_app_Native_setPaused(JNIEnv* env, jclas
 	if (paused) {
 		atomic_store(&G.flushRequested, true); // write the save when the app goes to the background
 	}
+#ifdef __ANDROID__
 	if (G.stream) {
 		if (paused) {
 			AAudioStream_requestPause(G.stream);
@@ -528,6 +797,7 @@ JNIEXPORT void JNICALL Java_com_linkplay_app_Native_setPaused(JNIEnv* env, jclas
 			AAudioStream_requestStart(G.stream);
 		}
 	}
+#endif
 }
 
 JNIEXPORT void JNICALL Java_com_linkplay_app_Native_stop(JNIEnv* env, jclass cls) {
@@ -538,29 +808,18 @@ JNIEXPORT void JNICALL Java_com_linkplay_app_Native_stop(JNIEnv* env, jclass cls
 		pthread_join(G.thread, NULL);
 		G.threadStarted = false;
 	}
+#ifdef __ANDROID__
 	if (G.stream) {
 		AAudioStream_requestStop(G.stream);
 		AAudioStream_close(G.stream);
 		G.stream = NULL;
 	}
+#endif
 	if (G.syncInit) pthread_mutex_lock(&G.stateMutex); // no snapshot op may touch the core while it goes
-	if (G.core) {
-		if (G.netAttached) {
-			G.core->setPeripheral(G.core, mPERIPH_GBA_LINK_PORT, NULL);
-			NetLinkDestroy(&G.net);
-			G.netAttached = false;
-		}
-		if (atomic_exchange(&G.touchReady, false)) {
-			TouchNavDeinit(&G.touch);
-		}
-		G.core->deinit(G.core);
-		G.core = NULL;
+	if (G.core) { // only a fully loaded game gets here, so the audio side exists too
+		_closeCore();
 		mAudioResamplerDeinit(&G.resampler);
 		mAudioBufferDeinit(&G.audioOut);
-		free(G.video);
-		free(G.frame);
-		G.video = NULL;
-		G.frame = NULL;
 	}
 	if (G.syncInit) pthread_mutex_unlock(&G.stateMutex);
 }
@@ -597,16 +856,63 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_copyFrame(JNIEnv* env, j
 		return JNI_FALSE;
 	}
 	jshort* dst = (*env)->GetShortArrayElements(env, out, NULL);
+	if (!dst) {
+		return JNI_FALSE;
+	}
 	pthread_mutex_lock(&G.frameMutex);
-	for (unsigned i = 0; i < G.width * G.height; ++i) {
+	bool ok = G.frame != NULL; // stop() may have taken the buffer since the check above
+	for (unsigned i = 0; ok && i < G.width * G.height; ++i) {
 		uint32_t c = G.frame[i];
 		uint32_t r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
 		dst[i] = (jshort) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 	}
 	pthread_mutex_unlock(&G.frameMutex);
-	(*env)->ReleaseShortArrayElements(env, out, dst, 0);
-	return JNI_TRUE;
+	(*env)->ReleaseShortArrayElements(env, out, dst, ok ? 0 : JNI_ABORT);
+	return ok ? JNI_TRUE : JNI_FALSE;
 }
+
+#ifndef __ANDROID__
+// Latest frame as 0xFFRRGGBB ints (240x160), ready for a BufferedImage.TYPE_INT_RGB / TYPE_INT_ARGB.
+JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_copyFrameRgb(JNIEnv* env, jclass cls, jintArray out) {
+	(void) cls;
+	if (!G.frame || (*env)->GetArrayLength(env, out) < (jsize) (G.width * G.height)) {
+		return JNI_FALSE;
+	}
+	jint* dst = (*env)->GetIntArrayElements(env, out, NULL);
+	if (!dst) {
+		return JNI_FALSE;
+	}
+	pthread_mutex_lock(&G.frameMutex);
+	bool ok = G.frame != NULL; // stop() may have taken the buffer since the check above
+	for (unsigned i = 0; ok && i < G.width * G.height; ++i) {
+		uint32_t c = G.frame[i]; // mColor: 0x??BBGGRR
+		dst[i] = (jint) (0xFF000000u | ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF));
+	}
+	pthread_mutex_unlock(&G.frameMutex);
+	(*env)->ReleaseIntArrayElements(env, out, dst, ok ? 0 : JNI_ABORT);
+	return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// Pull model for the host's audio device: always fills [frames] interleaved stereo frames (48000 Hz,
+// signed 16-bit, volume applied), zero-padded on underrun; returns how many frames were real audio.
+JNIEXPORT jint JNICALL Java_com_linkplay_app_Native_audioRead(JNIEnv* env, jclass cls, jshortArray out, jint frames) {
+	(void) cls;
+	jsize cap = (*env)->GetArrayLength(env, out) / 2;
+	if (frames <= 0 || frames > cap) {
+		frames = cap;
+	}
+	jshort* dst = (*env)->GetShortArrayElements(env, out, NULL);
+	if (!dst) {
+		return 0;
+	}
+	int32_t real = G.syncInit ? _audioPull((int16_t*) dst, frames) : 0;
+	if (!G.syncInit) {
+		memset(dst, 0, (size_t) frames * 4);
+	}
+	(*env)->ReleaseShortArrayElements(env, out, dst, 0);
+	return real;
+}
+#endif
 
 // ---------------------------------------------------------------- JNI: touch navigation
 
@@ -652,9 +958,13 @@ static jboolean _stateRequest(JNIEnv* env, jstring jpath, int op) {
 		pthread_mutex_unlock(&G.stateMutex);
 		goto done;
 	}
-	struct timespec until;
+	struct timespec until; // the state condition variable has the default (realtime) clock everywhere
+#ifdef _WIN32
+	_deadlineIn(&until, 3000);
+#else
 	clock_gettime(CLOCK_REALTIME, &until);
 	until.tv_sec += 3;
+#endif
 	while (G.stateOp != STATE_NONE) { // someone else's request is still running
 		if (pthread_cond_timedwait(&G.stateCond, &G.stateMutex, &until) == ETIMEDOUT) {
 			pthread_mutex_unlock(&G.stateMutex);
@@ -758,14 +1068,11 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_netWait(JNIEnv* env, jcl
 	(void) env;
 	(void) cls;
 	if (!G.syncInit) { // nothing loaded yet: the primitives don't exist
-		usleep((timeoutMs > 0 ? timeoutMs : 0) * 1000);
+		_idleSleepMs(timeoutMs);
 		return JNI_FALSE;
 	}
 	struct timespec t;
-	clock_gettime(CLOCK_MONOTONIC, &t);
-	long long ns = t.tv_nsec + (long long) (timeoutMs > 0 ? timeoutMs : 0) * 1000000LL;
-	t.tv_sec += ns / 1000000000LL;
-	t.tv_nsec = ns % 1000000000LL;
+	_deadlineIn(&t, timeoutMs > 0 ? timeoutMs : 0);
 	pthread_mutex_lock(&G.outMutex);
 	while (G.outLen == 0) {
 		if (pthread_cond_timedwait(&G.outCond, &G.outMutex, &t) != 0) {
@@ -777,6 +1084,7 @@ JNIEXPORT jboolean JNICALL Java_com_linkplay_app_Native_netWait(JNIEnv* env, jcl
 	return has ? JNI_TRUE : JNI_FALSE;
 }
 
+#ifdef __ANDROID__
 // ---------------------------------------------------------------- JNI: rendering
 
 bool bridgeFrameAcquire(const uint32_t** px, int* w, int* h, bool* isNew) {
@@ -784,6 +1092,10 @@ bool bridgeFrameAcquire(const uint32_t** px, int* w, int* h, bool* isNew) {
 		return false;
 	}
 	pthread_mutex_lock(&G.frameMutex);
+	if (!G.frame) { // stop() took the buffer away since the check above
+		pthread_mutex_unlock(&G.frameMutex);
+		return false;
+	}
 	*px = G.frame;
 	*w = G.width;
 	*h = G.height;
@@ -831,3 +1143,4 @@ JNIEXPORT void JNICALL Java_com_linkplay_app_Native_glSetAmbient(JNIEnv* env, jc
 	(void) cls;
 	renderSetAmbient(on != JNI_FALSE);
 }
+#endif // __ANDROID__

@@ -15,11 +15,18 @@ android/keystore.properties
 *.jks
 *.keystore
 
-# Games, saves and APKs: bring your own, ship APKs on the Releases page
-ROM/
-saves/
-dist/
-bin/
+# Desktop app (desktop/): Gradle, CMake and jpackage output
+desktop/build/
+desktop/.gradle/
+desktop/.kotlin/
+
+# Games, saves and APKs: bring your own, ship APKs on the Releases page.
+# The folder names are anchored to the repo root so they cannot hide a desktop source folder
+# of the same name (desktop/**/bin, dist, ...); the file patterns match anywhere.
+/ROM/
+/saves/
+/dist/
+/bin/
 *.gba
 *.sav
 *.ss

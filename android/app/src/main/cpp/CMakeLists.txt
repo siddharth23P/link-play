@@ -22,8 +22,11 @@ add_subdirectory("${MGBA_DIR}" mgba EXCLUDE_FROM_ALL)
 
 # TouchNav = the core (touchnav.c) + one file per screen area (touchnav_<area>.c).
 file(GLOB TOUCHNAV_SOURCES CONFIGURE_DEPENDS "${REPO_ROOT}/native/touchnav*.c")
-add_library(gbalink SHARED bridge.c render.c "${REPO_ROOT}/native/netlink.c" ${TOUCHNAV_SOURCES})
+# bridge.c is shared with the desktop app (desktop/native/CMakeLists.txt), so it lives in native/;
+# render.h, which it includes on Android, stays next to render.c.
+add_library(gbalink SHARED "${REPO_ROOT}/native/bridge.c" render.c "${REPO_ROOT}/native/netlink.c" ${TOUCHNAV_SOURCES})
 target_include_directories(gbalink PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
   "${MGBA_DIR}/include" "${MGBA_DIR}/src" "${CMAKE_CURRENT_BINARY_DIR}/mgba/include" "${REPO_ROOT}/native")
 
 # Compile with exactly the defines libmgba was built with (mGBA sets most of them

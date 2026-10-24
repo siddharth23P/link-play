@@ -1,6 +1,6 @@
 package com.linkplay.app
 
-/** The emulator core (mGBA + NetLink), implemented in src/main/cpp/bridge.c. */
+/** The emulator core (mGBA + NetLink), implemented in native/bridge.c (shared with the desktop app). */
 object Native {
     init {
         System.loadLibrary("gbalink")

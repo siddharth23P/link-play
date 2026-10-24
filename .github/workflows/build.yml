@@ -1,0 +1,374 @@
+name: Build
+
+# Builds the Android APK, the macOS dmgs (Apple Silicon and Intel) and the Windows installer and zip.
+# Pushing a tag like v1.1.0 also collects everything into a draft GitHub release.
+#
+# Release APK signing: add the repository secrets ANDROID_KEYSTORE_B64 (the .jks file, base64),
+# ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD. Without all four, CI builds
+# a debug APK ("Link Play dev") that is only kept as a CI artifact and is never put in a release.
+# The desktop builds are unsigned; see README.md for what users see when opening them.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The project pins NDK 28.2.13676358 and CMake 3.22.1; the runner image has other versions.
+      - name: Install NDK, CMake, platform and build tools
+        run: |
+          SDKM="$(command -v sdkmanager || true)"
+          [ -n "$SDKM" ] || SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;28.2.13676358" "cmake;3.22.1" "build-tools;36.0.0"
+          "$SDKM" "platforms;android-37.0" || "$SDKM" "platforms;android-37"
+
+      # Not on pull requests: they may come from branches whose workflow changes could read the secrets.
+      - name: Set up release signing (only if all four secrets exist)
+        id: signing
+        if: github.event_name != 'pull_request'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            umask 077
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            # A backslash is an escape character in a .properties file.
+            esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+            {
+              printf 'storeFile=%s\n' "$RUNNER_TEMP/release.jks"
+              printf 'storePassword=%s\n' "$(esc "$KEYSTORE_PASSWORD")"
+              printf 'keyAlias=%s\n' "$(esc "$KEY_ALIAS")"
+              printf 'keyPassword=%s\n' "$(esc "$KEY_PASSWORD")"
+            } > android/keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Release signing is set up."
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "No signing secrets: building the debug APK only."
+          fi
+
+      - name: Build the APK
+        working-directory: android
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          if [ "$SIGNED" = "true" ]; then
+            ./gradlew --no-daemon :app:assembleRelease
+          else
+            ./gradlew --no-daemon :app:assembleDebug
+          fi
+
+      # The shared com.linkplay.app.net tests (JVM only, no signing, no device).
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
+
+      - name: Name the APK
+        id: apk
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          mkdir -p apk-out
+          if [ "$SIGNED" = "true" ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk apk-out/LinkPlay-android.apk
+            echo "artifact=android-apk-release" >> "$GITHUB_OUTPUT"
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk apk-out/LinkPlay-android-debug.apk
+            echo "artifact=android-apk-debug" >> "$GITHUB_OUTPUT"
+          fi
+          ls -l apk-out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.apk.outputs.artifact }}
+          path: apk-out/*.apk
+          if-no-files-found: error
+
+  desktop-macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Toolchain
+        run: |
+          java -version
+          cmake --version | head -n 1
+          (ninja --version || echo "no ninja, CMake will use Makefiles") 2>&1 | head -n 1
+          uname -m
+
+      # Native library (libgbalink.dylib for this Mac's architecture), jar, Java runtime, app image.
+      - name: Build the app image
+        working-directory: android
+        run: ./gradlew --no-daemon -PdesktopOnly=true -PjpackageVerbose=true :desktop:packageAppImage
+
+      - name: Self-test the packaged app
+        timeout-minutes: 5
+        run: |
+          APP="desktop/build/app-image/Link Play.app"
+          REPORT="$RUNNER_TEMP/selftest.txt"
+          rm -f "$REPORT"
+          set +e
+          "$APP/Contents/MacOS/Link Play" --selftest "$REPORT"
+          rc=$?
+          set -e
+          if [ ! -f "$REPORT" ]; then
+            echo "::error::The self-test wrote no report (exit code $rc)"
+            exit 1
+          fi
+          cat "$REPORT"
+          if [ "$rc" -ne 0 ] || grep -q '^[[:space:]]*FAIL' "$REPORT" || ! grep -q '^[[:space:]]*PASS' "$REPORT"; then
+            echo "::error::Self-test failed (exit code $rc)"
+            exit 1
+          fi
+
+      # hdiutil sometimes fails with "Resource busy" on runners, so try up to three times.
+      - name: Package the dmg
+        working-directory: android
+        run: |
+          ok=0
+          for attempt in 1 2 3; do
+            if ./gradlew --no-daemon -PdesktopOnly=true -PjpackageVerbose=true :desktop:packageDmg; then ok=1; break; fi
+            echo "::warning::packageDmg failed on attempt $attempt"
+            for v in /Volumes/Link\ Play*; do [ -d "$v" ] && hdiutil detach "$v" -force || true; done
+            sleep 15
+          done
+          [ "$ok" = 1 ]
+
+      - name: Check the dmg
+        run: |
+          DMG="desktop/build/dist/LinkPlay-$(sed -n 's/^version = "\(.*\)"$/\1/p' desktop/build.gradle.kts | head -n 1)-macos-${{ matrix.arch }}.dmg"
+          ls -l desktop/build/dist
+          test -f "$DMG"
+          hdiutil verify "$DMG"
+          MNT="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$MNT"
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$MNT" "$DMG"
+          APP="$MNT/Link Play.app"
+          codesign --verify --deep --strict "$APP"
+          /usr/libexec/PlistBuddy -c "Print :NSLocalNetworkUsageDescription" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist"
+          test -f "$APP/Contents/app/libgbalink.dylib"
+          test -f "$APP/Contents/app/THIRD_PARTY_NOTICES.md"
+          hdiutil detach "$MNT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-macos-${{ matrix.arch }}
+          path: desktop/build/dist/*.dmg
+          if-no-files-found: error
+
+  desktop-windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # UCRT64 matches the C runtime of Temurin 17 on Windows. path-type inherit keeps the Windows PATH
+      # (and JAVA_HOME) visible in the MSYS2 shell, so Gradle finds cmake, gcc and ninja from MSYS2
+      # and java and jpackage from the JDK.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      # JDK 17's jpackage needs WiX 3 (candle.exe, light.exe). The runner image has it; install it if a
+      # future image drops it.
+      - name: Check WiX 3
+        shell: pwsh
+        run: |
+          $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+          if (-not $candle) {
+            Write-Host "WiX 3 is not on PATH, installing it with Chocolatey"
+            choco install wixtoolset -y --no-progress
+            $wix = Get-ChildItem "${env:ProgramFiles(x86)}" -Directory -Filter "WiX Toolset v3*" | Select-Object -First 1
+            if ($wix) { Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $wix.FullName "bin") }
+            $candlePath = if ($wix) { Join-Path $wix.FullName "bin\candle.exe" } else { $null }
+          } else {
+            $candlePath = $candle.Source
+          }
+          if (-not $candlePath -or -not (Test-Path $candlePath)) { throw "WiX 3 (candle.exe) is not available" }
+          Write-Host "WiX candle: $candlePath (version $((Get-Item $candlePath).VersionInfo.FileVersion))"
+
+      - name: Toolchain
+        shell: msys2 {0}
+        run: |
+          which gcc cmake ninja objdump
+          gcc --version | head -n 1
+          cmake --version | head -n 1
+          echo "JAVA_HOME=$JAVA_HOME"
+
+      # Native library (gbalink.dll), jar, Java runtime, app image. CC is set so CMake does not pick Visual Studio.
+      - name: Build the app image
+        shell: msys2 {0}
+        env:
+          CC: gcc
+        run: |
+          cd android
+          ./gradlew --no-daemon -PdesktopOnly=true -PjpackageVerbose=true :desktop:packageAppImage
+
+      # gbalink.dll must only need Windows' own DLLs (no libgcc, no libwinpthread).
+      - name: Check the DLL dependencies
+        shell: msys2 {0}
+        run: sh desktop/packaging/windows/check-dll-deps.sh "desktop/build/app-image/Link Play/app/gbalink.dll"
+
+      - name: Self-test the packaged app
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $app = "desktop\build\app-image\Link Play\Link Play.exe"
+          $report = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          Remove-Item $report -ErrorAction SilentlyContinue
+          # The launcher is a Windows (GUI) program, so wait for it explicitly.
+          $p = Start-Process -FilePath $app -ArgumentList @("--selftest", "`"$report`"") -Wait -PassThru
+          if (-not (Test-Path $report)) { throw "The self-test wrote no report (exit code $($p.ExitCode))" }
+          Get-Content $report
+          if ($p.ExitCode -ne 0) { throw "Self-test exit code $($p.ExitCode)" }
+          if (Select-String -Path $report -Pattern '^\s*FAIL' -Quiet) { throw "Self-test reported FAIL" }
+          if (-not (Select-String -Path $report -Pattern '^\s*PASS' -Quiet)) { throw "Self-test reported no PASS" }
+
+      - name: Package the installer and the portable zip
+        shell: msys2 {0}
+        env:
+          CC: gcc
+        run: |
+          cd android
+          ./gradlew --no-daemon -PdesktopOnly=true -PjpackageVerbose=true :desktop:packageExe :desktop:packageZip
+
+      - name: List the results
+        shell: pwsh
+        run: Get-ChildItem desktop\build\dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-windows-x64
+          path: |
+            desktop/build/dist/*.exe
+            desktop/build/dist/*.zip
+          if-no-files-found: error
+
+      - name: Keep the jpackage logs if something failed
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jpackage-logs-windows
+          path: desktop/build/jpackage-tmp
+          if-no-files-found: ignore
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, desktop-macos, desktop-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # The file names carry the desktop version, so the tag has to match it.
+      - name: Check that the tag matches the version
+        run: |
+          ver="$(sed -n 's/^version = "\(.*\)"$/\1/p' desktop/build.gradle.kts | head -n 1)"
+          echo "tag $GITHUB_REF_NAME, desktop version $ver"
+          if [ "$GITHUB_REF_NAME" != "v$ver" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match version $ver in desktop/build.gradle.kts"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: desktop-*
+          path: release-files
+          merge-multiple: true
+
+      # Only exists when the signing secrets were set. The debug APK is never released.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: android-apk-release
+          path: release-files
+          merge-multiple: true
+
+      - name: Checksums and notes
+        run: |
+          cd release-files
+          ls -l
+          if ! ls *.apk > /dev/null 2>&1; then
+            echo "::notice::No signed APK in this release (the signing secrets are not set)."
+          fi
+          sha256sum * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          {
+            echo "Downloads: macOS (Apple Silicon and Intel dmg), Windows (installer and portable zip), and the Android APK when it is attached."
+            echo
+            echo "The desktop builds are not signed, so macOS and Windows warn on first open. README.md has the steps."
+            echo
+            echo "SHA-256:"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } > ../release-notes.md
+
+      - name: Upload to a draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          generate_release_notes: true
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          files: release-files/*
