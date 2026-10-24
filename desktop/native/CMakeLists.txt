@@ -109,6 +109,17 @@ if(WIN32)
   # winmm: timeBeginPeriod (bridge.c); shell32 ole32 uuid: mGBA's config directory lookup (config.c,
   # SHGetKnownFolderPath / CoTaskMemFree / FOLDERID_*); ws2_32 shlwapi: mGBA's own OS libraries.
   target_link_libraries(gbalink PRIVATE ws2_32 shlwapi winmm shell32 ole32 uuid)
+  # mingw-w64's fesetenv (libmingwex, pulled in by the CRT) needs __mingw_fe_dfl_env, which on x86_64 is
+  # only defined in the CRT_fp*.o startup objects that GCC adds to executables, not to a -shared DLL
+  # ("undefined reference to `__mingw_fe_dfl_env'"). CRT_fp8.o is Windows' own default (x87 53-bit,
+  # MXCSR 0x1f80), so the DLL never moves the JVM thread's floating-point state away from what Windows set.
+  execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-file-name=CRT_fp8.o
+    OUTPUT_VARIABLE MINGW_CRT_FP8 OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(EXISTS "${MINGW_CRT_FP8}")
+    target_link_libraries(gbalink PRIVATE "${MINGW_CRT_FP8}")
+  else()
+    message(WARNING "CRT_fp8.o not found (${MINGW_CRT_FP8}): the DLL link may miss __mingw_fe_dfl_env")
+  endif()
   # winpthreads' <pthread.h> comes before any mGBA header in touchnav.h. If it pulls in <windows.h>, the
   # lean variant keeps winsock.h out so the later <winsock2.h> (mgba-util/common.h) still compiles.
   target_compile_definitions(gbalink PRIVATE WIN32_LEAN_AND_MEAN)
